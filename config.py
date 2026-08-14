@@ -45,7 +45,10 @@ class Settings:
     # Access control
     admin_user_id: int
 
-    # Channels — may be unset at first boot, configured later via /setsource /settarget
+    # LEGACY single-service env vars — kept only for backward compatibility with
+    # the original single-source/target build. The current multi-service system
+    # stores all services in the database (via /addservice) and does NOT require
+    # these; they are unused by main.py unless you explicitly wire them in.
     source_channel_id: int | None
     target_channel_id: int | None
 

@@ -1,30 +1,35 @@
 """
-forwarder.py — The final safety gate before anything reaches the target channel.
+forwarder.py — The final safety gate before anything reaches any target channel.
 
-This module implements the mandatory fail-closed pipeline from the spec:
+Rewritten for the multi-service, filter-based architecture (the old
+toss-pattern matcher is gone). Pipeline for every new source-channel message:
 
-    if not matcher.is_valid(message): return
-    if already_processed(message): return
-    if not forwarding_enabled: return
-    if not strict_toss_validation(message): return   # re-check, belt & braces
-    forward_original_message()
-    record_processed_message()
+    1. Identify which service(s) this source channel belongs to.
+    2. For each matching, ENABLED service:
+       a. media/content-type check  -> text-only, or reject
+       b. link check                -> no URL/link, or reject
+       c. blacklist check           -> no blacklisted term, or reject
+       d. dedup check                -> not already processed, or skip
+       e. forward the ORIGINAL message, unmodified, to THAT service's target only
+       f. record processed + stats
 
-Only this module is allowed to send messages into the target channel.
-Nothing else in the codebase should call target-channel send APIs directly.
+A message from Source A can only ever reach Source A's configured target(s) —
+services are looked up by exact source_channel_id match, and each service's
+forward call is scoped to that service's own target_channel_id.
+
+Only this module is allowed to send messages into target channels.
 """
 
 from __future__ import annotations
 
 import logging
-import time
 from typing import Optional
 
 from telethon import TelegramClient
 from telethon.tl.custom import Message
 
 from database import Database
-from matcher import TossMatcher
+from filters import evaluate_message
 
 
 class Forwarder:
@@ -32,71 +37,70 @@ class Forwarder:
         self,
         user_client: TelegramClient,
         db: Database,
-        matcher: TossMatcher,
         logger: logging.Logger,
-        get_target_channel_id,
-        get_forwarding_enabled,
+        get_blacklist,
     ):
-        """
-        get_target_channel_id / get_forwarding_enabled are async callables so the
-        forwarder always reads the latest admin-configured values from the DB
-        rather than a stale snapshot taken at startup.
-        """
+        """get_blacklist is an async callable returning the current blacklist
+        (list[str]) so changes via /addblacklist take effect immediately
+        without restarting."""
         self.user_client = user_client
         self.db = db
-        self.matcher = matcher
         self.logger = logger
-        self._get_target_channel_id = get_target_channel_id
-        self._get_forwarding_enabled = get_forwarding_enabled
+        self._get_blacklist = get_blacklist
 
-    async def handle_incoming(self, message: Message, source_channel_id: int):
-        """Entry point called by telegram_user.py for every new channel message."""
-        await self.db.increment("checked")
-
-        text_for_matching = self._extract_matchable_text(message)
-
-        # CHECK: does it match?
-        result = self.matcher.evaluate(text_for_matching)
-        if not result.matched:
-            await self.db.increment("ignored")
-            await self.db.log_match(message.id, "NO_MATCH", result.reason)
+    async def handle_incoming(self, message: Message, matching_services: list[dict]):
+        """matching_services: all ENABLED services whose source_channel_id
+        matches this message's chat. Normally a source belongs to exactly one
+        service, but the lookup supports multiple services sharing a source
+        without ever mixing targets."""
+        if not matching_services:
             return
 
-        await self.db.increment("matched")
+        await self.db.increment("received")
+        blacklist = await self._get_blacklist()
+        result = evaluate_message(message, blacklist)
 
-        # CHECK: already processed? (dedup on channel_id + message_id)
-        if await self.db.is_processed(source_channel_id, message.id):
+        source_channel_id = message.chat_id
+
+        if not result.allowed:
+            await self.db.increment("blocked")
+            for service in matching_services:
+                await self.db.record_service_block(service["id"])
+                await self.db.log_event(
+                    "blocked", service_id=service["id"],
+                    source_message_id=message.id, detail=result.reason,
+                )
+            return
+
+        # Allowed text message -> forward independently to each matching service's own target.
+        for service in matching_services:
+            await self._forward_to_service(message, source_channel_id, service, result)
+
+    async def _forward_to_service(self, message: Message, source_channel_id: int, service: dict, result):
+        service_id = service["id"]
+        target_channel_id = service["target_channel_id"]
+
+        # Dedup check.
+        if await self.db.is_processed(service_id, source_channel_id, message.id):
             await self.db.increment("duplicates_prevented")
-            await self.db.log_match(message.id, "DUPLICATE_SKIPPED", "")
+            await self.db.log_event("duplicate", service_id=service_id, source_message_id=message.id)
             return
 
-        # CHECK: forwarding enabled?
-        forwarding_enabled = await self._get_forwarding_enabled()
-        if not forwarding_enabled:
-            await self.db.log_match(message.id, "MATCHED_BUT_DISABLED", "")
-            return
-
-        target_channel_id = await self._get_target_channel_id()
-        if not target_channel_id:
-            self.logger.warning("Match found but no target channel configured; not forwarding.")
-            await self.db.log_match(message.id, "MATCHED_NO_TARGET", "")
-            return
-
-        # FINAL SAFETY GATE: re-validate immediately before sending. This
-        # guards against any state mutation between the initial check and
-        # send, and enforces fail-closed behavior on any exception.
+        # Final safety re-check immediately before sending (fail closed).
         try:
-            final_check = self.matcher.evaluate(text_for_matching)
-            if not final_check.matched:
-                await self.db.log_match(message.id, "FINAL_GATE_REJECTED", final_check.reason)
+            final = evaluate_message(message, await self._get_blacklist())
+            if not final.allowed:
+                await self.db.log_event(
+                    "final_gate_rejected", service_id=service_id,
+                    source_message_id=message.id, detail=final.reason,
+                )
                 return
         except Exception as exc:
-            self.logger.exception("Matcher raised during final safety gate; refusing to forward.")
+            self.logger.exception("Final safety gate raised for service %s; refusing to forward.", service_id)
             await self.db.increment("errors")
-            await self.db.log_match(message.id, "FINAL_GATE_ERROR", str(exc))
+            await self.db.log_event("error", service_id=service_id, source_message_id=message.id, detail=str(exc))
             return
 
-        # Forward the ORIGINAL message unchanged (no rewriting, no captions added).
         try:
             sent = await self.user_client.forward_messages(
                 entity=target_channel_id,
@@ -104,38 +108,27 @@ class Forwarder:
             )
             dest_id = self._extract_dest_id(sent)
         except Exception as exc:
-            self.logger.exception("Forward failed for source_message_id=%s", message.id)
+            self.logger.exception("Forward failed (service=%s, source_message_id=%s)", service_id, message.id)
             await self.db.increment("errors")
-            await self.db.log_match(message.id, "FORWARD_FAILED", str(exc))
+            await self.db.record_service_error(service_id, str(exc))
+            await self.db.log_event("error", service_id=service_id, source_message_id=message.id, detail=str(exc))
             return
 
         newly_recorded = await self.db.mark_processed(
-            source_channel_id, message.id, dest_id, match_result="MATCH"
+            service_id, source_channel_id, message.id, dest_id, result="FORWARDED"
         )
         if newly_recorded:
             await self.db.increment("forwarded")
-            await self.db.set_setting("last_match_ts", time.time())
-            await self.db.log_match(
-                message.id, "FORWARDED", f"team={result.team} decision={result.decision}"
-            )
+            await self.db.record_service_forward(service_id)
+            await self.db.log_event("forwarded", service_id=service_id, source_message_id=message.id)
             self.logger.info(
-                "Forwarded message %s (team=%s, decision=%s) -> target",
-                message.id, result.team, result.decision,
+                "Forwarded message %s from source %s to target %s (service %s)",
+                message.id, source_channel_id, target_channel_id, service_id,
             )
         else:
-            # Extremely rare race: another handler already recorded it first.
+            # Rare race: another handler already recorded it first.
             await self.db.increment("duplicates_prevented")
-            self.logger.warning(
-                "Message %s forwarded but a duplicate record already existed (race).",
-                message.id,
-            )
-
-    @staticmethod
-    def _extract_matchable_text(message: Message) -> Optional[str]:
-        # Per spec: run matcher against message.text and, when applicable, caption.
-        # Telethon exposes both plain text and media captions via `.message` /
-        # `.raw_text`; for media messages the caption is also in `.message`.
-        return message.raw_text or message.message or None
+            await self.db.log_event("duplicate_race", service_id=service_id, source_message_id=message.id)
 
     @staticmethod
     def _extract_dest_id(sent) -> Optional[int]:

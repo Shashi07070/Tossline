@@ -1,21 +1,22 @@
 """
-main.py — Toss Forward Bot entrypoint.
+main.py — Toss Forward Bot entrypoint (multi-service, filter-based edition).
 
 Run with:  python main.py
 
 Startup sequence:
-  1. Load settings (fails fast on missing required env vars).
-  2. Connect SQLite database, seed dynamic settings from env if unset.
-  3. Build the pattern matcher from stored (or default) pattern config.
-  4. Start the admin bot (python-telegram-bot) for /commands.
-  5. Authorize + connect the Telethon user client (first run prompts for login).
-  6. Wire the Forwarder as the single gate between "new source message" and
-     "posted to target channel".
-  7. Run until disconnected; handle reconnects/FloodWait via Telethon's
-     built-in retry behavior plus our own exception guards.
+  1. Load settings (fails fast on missing required env vars). Legacy
+     SOURCE_CHANNEL_ID/TARGET_CHANNEL_ID are NOT required anymore — services
+     live in the database and are managed via /addservice.
+  2. Connect SQLite database (additive migration — no data is dropped).
+  3. Start the admin bot (python-telegram-bot) for /commands.
+  4. Reuse the EXISTING Telethon session if valid (no forced re-login).
+  5. Wire the Forwarder as the single gate between "new source message" and
+     "posted to a target channel", routed per-service.
+  6. Run until disconnected; reconnect automatically on drop.
 
-No startup/shutdown/status message is ever sent to the target channel —
-all of that goes to the admin's private chat with the bot, or to local logs.
+No startup/shutdown/status/blocked message is ever sent to any target
+channel — all of that goes to the admin's private chat with the bot, or to
+local logs (LOG_PATH) / the event_log table.
 """
 
 from __future__ import annotations
@@ -27,7 +28,6 @@ import time
 from config import settings
 from database import Database
 from logger import setup_logger
-from matcher import TossMatcher, DEFAULT_PATTERN_CONFIG
 from telegram_user import TelegramUserClient
 from telegram_bot import TelegramBot
 from forwarder import Forwarder
@@ -35,73 +35,53 @@ from forwarder import Forwarder
 
 async def async_main():
     logger = setup_logger("toss_forward_bot", settings.log_path)
-    logger.info("Starting Toss Forward Bot...")
+    logger.info("Starting Toss Forward Bot (multi-service)...")
 
     db = Database(settings.db_path)
     await db.connect()
 
-    # Seed dynamic settings from env on first run only (don't clobber admin changes).
-    if await db.get_setting("source_channel_id") is None and settings.source_channel_id:
-        await db.set_setting("source_channel_id", settings.source_channel_id)
-    if await db.get_setting("target_channel_id") is None and settings.target_channel_id:
-        await db.set_setting("target_channel_id", settings.target_channel_id)
-    if await db.get_setting("forwarding_enabled") is None:
-        await db.set_setting("forwarding_enabled", False)
-    if await db.get_setting("pattern_config") is None:
-        await db.set_setting("pattern_config", DEFAULT_PATTERN_CONFIG)
+    # One-time convenience migration: if legacy SOURCE_CHANNEL_ID/TARGET_CHANNEL_ID
+    # are set in .env AND no services exist yet at all, create Service #1 from
+    # them so upgrading doesn't silently stop forwarding. This never runs again
+    # once at least one service exists, and never overwrites admin-managed services.
+    existing_services = await db.list_services()
+    if not existing_services and settings.source_channel_id and settings.target_channel_id:
+        service_id = await db.add_service(settings.source_channel_id, settings.target_channel_id)
+        logger.info(
+            "Migrated legacy SOURCE_CHANNEL_ID/TARGET_CHANNEL_ID from .env into Service #%s.",
+            service_id,
+        )
 
-    pattern_config = await db.get_setting("pattern_config", DEFAULT_PATTERN_CONFIG)
-    matcher_holder = {"matcher": TossMatcher(pattern_config)}
+    start_time = time.time()
 
-    # Shared mutable state for admin commands that need things which don't
-    # exist yet at TelegramBot-construction time (e.g. the Telethon client),
-    # or process-level facts (start time) — see handlers.py docstring.
-    runtime = {
-        "start_time": time.time(),
-        "get_user_client": lambda: None,  # replaced below once user_client exists
-    }
-
-    # --- Admin bot (control plane) ---
-    bot = TelegramBot(settings.bot_token, settings.admin_user_id, db, matcher_holder, logger, runtime)
-    await bot.start()
-
-    # --- User client (monitors source channel) ---
+    # --- User client (reuses existing Telethon session; monitors all configured sources) ---
     user_client = TelegramUserClient(settings, logger)
     await user_client.ensure_authorized()
-    runtime["get_user_client"] = lambda: user_client.client
 
-    async def get_target_channel_id():
-        return await db.get_setting("target_channel_id")
+    # --- Admin bot (control plane) ---
+    bot = TelegramBot(settings.bot_token, settings.admin_user_id, db, user_client.client, logger)
+    await bot.start()
 
-    async def get_forwarding_enabled():
-        return bool(await db.get_setting("forwarding_enabled", False))
+    async def get_blacklist():
+        return await db.list_blacklist()
 
-    async def get_source_channel_id():
-        return await db.get_setting("source_channel_id")
+    async def get_all_services():
+        return await db.list_services()
 
     forwarder = Forwarder(
         user_client=user_client.client,
         db=db,
-        matcher=matcher_holder["matcher"],
         logger=logger,
-        get_target_channel_id=get_target_channel_id,
-        get_forwarding_enabled=get_forwarding_enabled,
+        get_blacklist=get_blacklist,
     )
 
-    # Keep forwarder's matcher reference in sync if /setpattern hot-swaps it.
-    class _ForwarderMatcherProxy:
-        def evaluate(self, text):
-            return matcher_holder["matcher"].evaluate(text)
-
-        def is_match(self, text):
-            return matcher_holder["matcher"].is_match(text)
-
-    forwarder.matcher = _ForwarderMatcherProxy()
-
-    user_client.bind_forwarder(forwarder, get_source_channel_id)
+    user_client.bind_forwarder(forwarder, get_all_services)
     user_client.register_handlers()
 
-    logger.info("Toss Forward Bot fully started. Monitoring for new messages only (no history scan).")
+    logger.info(
+        "Toss Forward Bot fully started. %d service(s) configured. Monitoring for new messages only.",
+        len(await db.list_services()),
+    )
 
     stop_event = asyncio.Event()
 

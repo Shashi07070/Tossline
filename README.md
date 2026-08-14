@@ -1,295 +1,321 @@
-# Toss Forward Bot
+# Toss Forward Bot — v2.0 (Multi-Service, Filter-Based)
 
-A production-ready Telegram forwarding system that watches a source channel and
-forwards **only** messages matching a strict "won the toss" alert pattern into a
-target channel — nothing else, ever.
+**This is an update to the existing Toss Forward Bot project.** The old
+toss-pattern matcher has been completely removed. The bot now supports
+multiple independent source → target forwarding services, each filtered by
+media type, links, and a global blacklist — with no pattern-matching
+requirement at all.
 
 ```
-SOURCE CHANNEL → USER ACCOUNT (Telethon) → Strict Matcher → MATCH? → TARGET CHANNEL
-                                                            → NO MATCH → ignored
+SOURCE CHANNEL (any of N) → USER ACCOUNT (Telethon, existing session) → Filters → ALLOWED? → that source's TARGET CHANNEL
+                                                                                  → NO → ignored (never notified anywhere)
 ```
-
-- **USER ACCOUNT** (Telethon/MTProto): a normal member of the source channel, no
-  admin rights needed there. It also performs the actual forward into the target
-  channel.
-- **BOT ACCOUNT** (python-telegram-bot): admin control plane only — `/status`,
-  `/setpattern`, `/test`, etc. It does **not** need to be in the source channel,
-  and it never posts to the target channel itself.
 
 ---
 
-## 1. Prerequisites
+## 1. What changed
 
-- Python 3.11+
-- A Telegram account to act as the USER ACCOUNT (must be a member of the source channel)
-- A Telegram Bot token for the BOT ACCOUNT (admin control plane)
+### Files changed
+- `database.py` — added `services`, `blacklist`, `processed_messages_v2`, `event_log` tables. Old tables (`processed_messages`, `kv_settings`, `stats`, `match_log`) are **kept, never dropped**.
+- `forwarder.py` — rewritten for multi-service routing + the new filter pipeline (media/link/blacklist) instead of pattern matching.
+- `telegram_user.py` — rewritten to route incoming messages to every enabled service whose source channel matches, with a defensive guard so a target channel can never accidentally act as a source. **Reuses the existing Telethon session — no re-login is triggered.**
+- `handlers.py` — rewritten with the full new command set (service management, blacklist, monitoring).
+- `telegram_bot.py` — rewritten to wire the new commands plus a callback-query handler (for `/removeservice` confirmation buttons) and a text-reply handler (for the interactive `/addservice` / `/addblacklist` / `/removeblacklist` flows).
+- `main.py` — rewritten: no longer requires `SOURCE_CHANNEL_ID`/`TARGET_CHANNEL_ID`; services live in the database, managed via `/addservice`. A one-time convenience migration promotes legacy env-var values into "Service #1" **only if no services exist yet**, so upgrading doesn't silently stop forwarding.
+- `config.py` — legacy `SOURCE_CHANNEL_ID`/`TARGET_CHANNEL_ID` are now explicitly documented as optional/deprecated (they were already optional in the dataclass).
+- `.env.example` — updated to reflect the above; existing `.env` files are untouched and still work.
+- `requirements.txt` — Telethon pin loosened to `>=1.36.0,<2.0.0` so a redeploy never reinstalls an older pinned version over a working one.
+
+### Files removed
+- `matcher.py` — the entire toss-pattern matching engine. Deleted, not just disabled.
+- `test_matcher.py` — its tests (pattern-specific) are no longer applicable.
+
+### Files added
+- `filters.py` — the new filter pipeline: `is_text_only_message()`, `contains_link()`, `contains_blacklisted_term()`, `evaluate_message()`.
+- `test_filters.py` — unit tests for the new filter pipeline (21 tests, all passing — see §10).
+
+### Dependencies changed
+- `telethon` pin loosened from `==1.36.0` to `>=1.36.0,<2.0.0`.
+- No other dependency changes (`python-telegram-bot`, `aiosqlite`, `python-dotenv` unchanged).
+
+### Confirmation: the old toss pattern matcher is completely removed
+`matcher.py` and `test_matcher.py` no longer exist in the project. No code
+path requires a message to contain `"WON THE TOSS"` or any BAT/BOWL
+structure. Forwarding is now driven entirely by the filter pipeline in
+`filters.py`.
 
 ---
 
-## 2. Setup steps
+## 2. New architecture
 
-### 2.1 Create the Telegram bot (BotFather)
+- **USER ACCOUNT** (Telethon, your existing authorized session): reads every
+  configured source channel and performs the actual forward. Does not need
+  admin rights in any source channel.
+- **BOT ACCOUNT** (python-telegram-bot): admin control plane only — all
+  `/commands`. Never posts to any target channel itself.
+- **Services**: each service is an independent `source_channel_id →
+  target_channel_id` pair, stored in SQLite, managed via `/addservice`,
+  `/services`, `/startservice`, `/stopservice`, `/removeservice`. Messages
+  from Source A can only ever reach Source A's own target(s) — there is no
+  code path that looks up a different service's target.
 
-1. Open a chat with **@BotFather** on Telegram.
-2. Send `/newbot`, follow the prompts, and copy the token it gives you.
-3. Put it in `.env` as `BOT_TOKEN`.
+### Forwarding rule (no pattern required)
 
-### 2.2 Obtain your Telegram API ID / API HASH
+For every new message from a configured, enabled source:
 
-1. Go to https://my.telegram.org and log in with the phone number you'll use
-   for the USER ACCOUNT.
-2. Open **API Development Tools**, create an app, and copy `api_id` / `api_hash`.
-3. Put them in `.env` as `TELEGRAM_API_ID` / `TELEGRAM_API_HASH`.
+1. **Media/content-type check** — must be genuinely text-only (no photo,
+   video, GIF, sticker, voice, video note, audio, document, contact,
+   location, poll, or game — even if a caption/text is also present).
+2. **Link check** — reject if it contains `http://`, `https://`, `www.`,
+   `t.me/`, `telegram.me/`, `telegram.dog/`, or a recognizable domain
+   pattern (case-insensitive).
+3. **Blacklist check** — reject if it contains any admin-configured
+   blacklisted word/phrase (case-insensitive substring match).
+4. **Dedup check** — reject if this exact `(service, source_channel_id,
+   source_message_id)` was already processed.
+5. **Forward** — the original message, completely unmodified, to that
+   service's target only.
 
-### 2.3 Configure environment variables
+Any exception anywhere in the pipeline is caught and treated as **blocked**
+(fail closed) — nothing uncertain is ever forwarded.
+
+---
+
+## 3. Database migration instructions
+
+No manual migration step is required — `database.py` creates the new tables
+alongside the old ones automatically on startup (`CREATE TABLE IF NOT
+EXISTS`), and nothing is dropped.
+
+**If you were running the old single-service version with `SOURCE_CHANNEL_ID`
+and `TARGET_CHANNEL_ID` set in `.env`:** on first startup after this update,
+if no services exist yet in the database, those two values are automatically
+migrated into "Service #1" so forwarding doesn't stop. After that, manage
+everything via `/addservice` etc. — the env vars are ignored from then on.
+
+If you'd rather start clean instead of auto-migrating, just run `/addservice`
+yourself and leave `SOURCE_CHANNEL_ID`/`TARGET_CHANNEL_ID` blank in `.env`.
+
+Your existing `toss_forward.db` file and `.session` file are both reused
+as-is — back them up before deploying if you want a safety net, but nothing
+in this update deletes or recreates them.
+
+---
+
+## 4. Exact AWS deployment commands
+
+Assuming the existing AWS deployment (systemd service `toss-forward-bot.service`):
 
 ```bash
-cp .env.example .env
-# then edit .env and fill in BOT_TOKEN, TELEGRAM_API_ID, TELEGRAM_API_HASH, ADMIN_USER_ID
+# 1. SSH into the instance
+ssh your-user@your-instance
+
+# 2. Go to the project directory
+cd /path/to/toss-forward-bot
+
+# 3. Stop the running service
+sudo systemctl stop toss-forward-bot.service
+
+# 4. Back up the database and session (recommended, not required)
+cp toss_forward.db toss_forward.db.bak
+cp toss_forward_user.session toss_forward_user.session.bak
+
+# 5. Deploy the updated files (matcher.py / test_matcher.py should be
+#    removed; all other files listed in §1 replaced/added)
+#    e.g. via git pull, scp, or your existing deployment method
+
+# 6. Update dependencies (Telethon pin loosened — pip will keep or upgrade
+#    within the >=1.36.0,<2.0.0 range, never downgrade a working install)
+source venv/bin/activate
+pip install -r requirements.txt --upgrade
+
+# 7. Restart the service
+sudo systemctl restart toss-forward-bot.service
+
+# 8. Confirm it's running and check logs
+sudo systemctl status toss-forward-bot.service
+tail -f toss_forward.log
 ```
 
-`ADMIN_USER_ID` is your own numeric Telegram user id (e.g. from **@userinfobot**).
-Only this user can run admin commands against the bot.
-
-### 2.4 Install dependencies
+## 5. Exact systemd restart command
 
 ```bash
-python -m venv venv
-source venv/bin/activate   # Windows: venv\Scripts\activate
-pip install -r requirements.txt
+sudo systemctl restart toss-forward-bot.service
 ```
 
-### 2.5 Log in the USER ACCOUNT (first run)
-
-```bash
-python main.py
-```
-
-On first run it will prompt, in the terminal, for:
-
-1. Phone number (with country code)
-2. The OTP code Telegram sends you
-3. Your 2FA password, only if you have two-factor auth enabled
-
-After a successful login, a Telethon session file is saved (named per
-`TELETHON_SESSION`) and reused automatically on every future start — you will
-not be prompted again unless the session is deleted or revoked.
-
-**The USER ACCOUNT needs access to (membership in) the source channel.**
-**The BOT ACCOUNT does not need to be present in the source channel at all.**
-
-### 2.6 Add the bot as administrator to the target channel
-
-Open the target channel → Administrators → Add Admin → add your bot.
-(The bot account needs appropriate permission in the target channel per the
-architecture; the actual forward call is issued by the USER ACCOUNT, so make
-sure the USER ACCOUNT also has permission to post there — e.g. it's a member
-with posting rights, or an admin, depending on how the channel is configured.)
-
-### 2.7 Configure the source and target channels
-
-In a private chat with your bot (as the admin user):
-
-```
-/setsource -1001234567890
-/settarget -1009876543210
-```
-
-Channel ids are numeric; you can get them via any channel-id-lookup bot, or by
-forwarding a channel message to **@userinfobot** / **@JsonDumpBot**.
-
-### 2.8 Configure the toss pattern
-
-The default pattern (matching the current source format) is applied automatically.
-To customize it later:
-
-```
-/setpattern {"toss_phrase": "WON THE TOSS", "decision_variants": {"DECIDED TO BAT": "BAT", "DECIDED TO BOWL": "BOWL", "DICIDED TO BAT": "BAT", "DICIDED TO BOWL": "BOWL"}}
-```
-
-`/setpattern` with no arguments shows the current default config as a starting template.
-
-### 2.9 Test the pattern
-
-```
-/test 🇷🇼 RWANDA - U19 🇷🇼 WON THE TOSS AND DECIDED TO BAT ✔️✔️
-```
-
-The bot replies **privately** with `MATCH ✅` or `NO MATCH ❌` plus a breakdown.
-This test output is never sent to the target channel.
-
-### 2.10 Enable forwarding
-
-```
-/enable
-```
-
-(`/enable` refuses to run until both source and target are configured.)
-
-### 2.11 Verify forwarding
-
-Post a message matching the pattern in the source channel and confirm it
-appears, unmodified, in the target channel. Check `/status` for updated counters.
-
-### 2.12 Deploy
-
-See **Deployment** below.
-
-### 2.13 Troubleshooting
-
-See **Troubleshooting** below.
+The existing unit file does not need to change — it still just runs `python
+main.py`. It continues to:
+- start automatically after reboot (if `enabled`)
+- restart after crashes (if `Restart=on-failure` or similar is set, as before)
+- keep running after SSH disconnects
+- reconnect to Telegram automatically (Telethon's built-in reconnect logic)
 
 ---
 
-## 3. Admin commands
+## 6. Telegram command list
 
-All commands are usable **only** by `ADMIN_USER_ID`; anyone else gets `Unauthorized.`
+**Basic**
+- `/start`, `/help`
 
-| Command | Purpose |
-|---|---|
-| `/start` | Show command list |
-| `/status` | Show running status, source/target, forwarding state, and counters |
-| `/setsource <channel_id>` | Set the source channel to monitor |
-| `/settarget <channel_id>` | Set the target channel to forward into |
-| `/setpattern <json>` | Replace/update the matching pattern config |
-| `/test <text>` | Dry-run the matcher against sample text, privately |
-| `/enable` | Turn forwarding on |
-| `/disable` | Turn forwarding off |
-| `/logs` | Show the most recent match/no-match decisions |
-| `/config` | Show current source, target, enabled flag, and pattern config |
-| `/reset` | Reset the stats counters to zero |
+**Service management**
+- `/addservice` — interactive: bot asks for source channel ID, then target channel ID, validates access to both, creates the service (ENABLED by default)
+- `/services` — list all services with status and per-service forwarded/blocked counts
+- `/service <id>` — detail view for one service (status, source, target, counts, last forwarded, last error)
+- `/startservice <id>` / `/stopservice <id>` — enable/disable one service; others keep running
+- `/removeservice <id>` — asks for CONFIRM/CANCEL before deleting
 
----
+**Global**
+- `/startall` / `/stopall` — enable/disable every service at once (bot itself stays online either way)
 
-## 4. How the strict matching prevents unrelated messages from reaching the target
+**Filters**
+- `/blacklist` — show all blacklisted terms
+- `/addblacklist` — interactive ("Send the word or phrase to blacklist.") or `/addblacklist <term>` directly
+- `/removeblacklist` — interactive or `/removeblacklist <term>` directly
+- `/clearblacklist` — removes all blacklist entries
 
-The matcher (`matcher.py`) runs a sequential, fail-closed, multi-layer check —
-**every** layer must pass, in order, or the message is dropped silently:
+**Monitoring**
+- `/status` — services enabled/disabled counts, total forwarded/blocked/errors, uptime, Telethon connection state
+- `/stats` — global + per-service breakdown
+- `/health` — quick DB/Telethon connectivity check
+- `/logs` — recent 20 events (received/forwarded/blocked/duplicate/error) — private only
+- `/errors` — recent 20 error entries with detail
+- `/uptime` — process uptime
 
-1. **Team identifier check** — there must be non-trivial alphanumeric text
-   before the toss phrase (emoji/flags/punctuation are stripped as decoration,
-   never counted as the identifier itself, and never required).
-2. **Toss phrase check** — the literal configured phrase (default
-   `WON THE TOSS`) must appear.
-3. **Connector check** — the word `AND` must immediately follow (only
-   whitespace in between).
-4. **Decision check** — must immediately be followed by one of the configured
-   decision variants (`DECIDED TO BAT`, `DECIDED TO BOWL`, and the known typo
-   variants `DICIDED TO BAT` / `DICIDED TO BOWL`). Nothing else after "AND" is
-   accepted — `DECIDED TO PLAY` or arbitrary text fails here.
-5. **Ending check** — the decision must be immediately followed (whitespace
-   tolerated) by exactly the configured number of checkmark characters, and
-   **nothing substantive is allowed after them** — trailing junk like
-   "... ✔️✔️ Follow our channel!" is rejected.
-6. **Structural sanity** — because checks 1–5 are enforced in strict sequence
-   over contiguous text (not independently via "contains" checks anywhere in
-   the message), a message can't pass by having the right keywords scattered
-   in the wrong order or context (e.g. "Rwanda won the toss but match
-   cancelled" fails at the connector/decision stage).
+**Configuration**
+- `/reload` — confirms config is read live from the DB (nothing to actually reload)
+- `/version` — bot version string
 
-Any exception anywhere in the matcher is caught and converted into a
-**NO MATCH** result — the system fails closed by design. Typo tolerance is
-implemented as an explicit, configurable list of literal variants rather than
-fuzzy string matching, so it can never accidentally widen the net to catch
-unrelated messages.
-
-A final safety gate re-runs full validation immediately before the forward
-call in `forwarder.py`, and duplicate delivery is prevented via a SQLite
-`UNIQUE(source_channel_id, source_message_id)` constraint.
+All commands check the caller's numeric Telegram user ID against
+`ADMIN_USER_ID` — never a username. Anyone else gets `⛔ Unauthorized.` and
+nothing else.
 
 ---
 
-## 5. Deployment
-
-### Option A — Generic Python host / VPS
-
-```bash
-pip install -r requirements.txt
-cp .env.example .env   # fill in values
-python main.py
-```
-
-Run under a process supervisor (systemd, supervisord, pm2, or the platform's
-own worker mechanism) so it restarts automatically on crash. A `Procfile` is
-included for `Procfile`-based hosts:
+## 7. Example `/addservice` flow
 
 ```
-worker: python main.py
+Admin:  /addservice
+Bot:    Send source channel ID.
+Admin:  -1001631852106
+Bot:    Send target channel ID.
+Admin:  -1002284155038
+Bot:    Service #1
+        Source: -1001631852106
+        Target: -1002284155038
+        Status: ENABLED
 ```
 
-**Important:** the Telethon session file and the SQLite database must persist
-across restarts/deploys — mount/persist whatever directory `TELETHON_SESSION`
-and `DB_PATH` point to.
+If the USER account can't access either channel, the bot reports the
+specific problem and does **not** create a broken service:
 
-### Option B — Docker
-
-```bash
-docker build -t toss-forward-bot .
-docker run -d \
-  --name toss-forward-bot \
-  --env-file .env \
-  -v $(pwd)/data:/app/data \
-  toss-forward-bot
 ```
-
-The Dockerfile persists the session and database under `/app/data` via a
-volume so they survive container restarts.
-
-**Note on first login with Docker:** the interactive phone/OTP/2FA prompt
-needs a TTY. Run once interactively to create the session:
-
-```bash
-docker run -it --rm --env-file .env -v $(pwd)/data:/app/data toss-forward-bot
+Bot:    ❌ Could not access source channel -1001631852106: <error detail>
+        Make sure the USER account is a member of that channel, then try /addservice again.
 ```
-
-Then subsequent normal runs (`docker run -d ...`) will reuse the saved session.
 
 ---
 
-## 6. Running the tests
+## 8. Example blacklist setup
 
-```bash
-python -m pytest test_matcher.py -v
-# or
-python test_matcher.py
+```
+Admin:  /addblacklist
+Bot:    Send the word or phrase to blacklist.
+Admin:  casino
+Bot:    ✅ Added to blacklist.
 ```
 
-`test_matcher.py` covers all example messages from the spec (positive and
-negative), plus additional robustness cases (empty input, non-string input,
-whitespace variation, typo variants, custom pattern configs, and weird
-Unicode input never raising an exception).
+Or directly: `/addblacklist casino` does the same in one step.
+
+```
+Admin:  /blacklist
+Bot:    Blacklist:
+
+        - casino
+```
 
 ---
 
-## 7. Troubleshooting
+## 9. Setup / prerequisites (unchanged from before)
 
-| Symptom | Likely cause / fix |
-|---|---|
-| Bot prompts for phone/OTP every restart | `TELETHON_SESSION` path isn't persisted (e.g. ephemeral container filesystem) — mount a persistent volume. |
-| `Missing required environment variable: ...` | Copy `.env.example` to `.env` and fill in the missing value. |
-| `/setsource` accepted but nothing forwards | Run `/enable`, confirm `/status` shows `Forwarding: ENABLED`, and confirm the USER ACCOUNT is actually a member of the source channel. |
-| Matches detected in `/test` but nothing arrives in target | Check `/logs` for `FORWARD_FAILED` entries — usually a permissions issue; ensure the USER ACCOUNT can post in the target channel. |
-| `FloodWaitError` in logs | Telegram is rate-limiting; Telethon will wait automatically. Avoid restarting repeatedly. |
-| Old/backlog messages appear on startup | Should never happen — the client only listens for `NewMessage` events after connecting; there is no history scan. If seen, file it as a bug. |
-| Duplicate messages in target | Should not happen due to the SQLite unique constraint; check `/logs` for `DUPLICATE_SKIPPED` to confirm dedup is firing. |
-| Non-admin can run commands | Should never happen — every handler checks `ADMIN_USER_ID`. Verify `.env` has the correct numeric id (not a username). |
+Your existing `.env`, Telethon session, and deployment mechanism all
+continue to work as-is. If you're setting this up fresh, see the original
+setup steps for BotFather / my.telegram.org / first login — nothing about
+that process changed. The only difference: you no longer need to set
+`SOURCE_CHANNEL_ID` / `TARGET_CHANNEL_ID` — use `/addservice` after startup
+instead.
 
 ---
 
-## 8. Project structure
+## 10. Testing performed before this update was delivered
+
+All of the following were actually executed against the real code (not
+just written) before this was called complete:
+
+**Unit tests — `test_filters.py` (21 tests, all passing)**
+```
+python -m pytest test_filters.py -v
+```
+Covers link detection (all required forms + case-insensitivity + plain-text
+non-matches), blacklist matching (case-insensitive, empty inputs), the
+media/content-type gate (text-only vs. every blocked media type), and the
+combined `evaluate_message()` pipeline including a fail-closed check for
+broken/unexpected input.
+
+**Database smoke test** (`database.py`, run against a real SQLite file):
+service add/list/enable/disable, blacklist add/dup-reject/remove/clear,
+per-service dedup isolation, global + per-service stats/counters, service
+removal, event logging. All assertions passed.
+
+**End-to-end forwarder smoke test** (`forwarder.py`, real `Database` +
+fake Telethon client), directly covering the spec's test list:
+
+| # | Spec test | Result |
+|---|---|---|
+| 1 | Normal text → forwarded | PASSED |
+| 2 | Blacklisted text → blocked | PASSED |
+| 3 | Text with URL → blocked | PASSED |
+| 4 | Photo → blocked | PASSED |
+| 5 | Video → blocked | PASSED |
+| 6 | GIF → blocked | PASSED |
+| 7 | Sticker → blocked | PASSED |
+| 8 | Two source services → each only reaches its own target | PASSED |
+| 9 | Duplicate delivery → not forwarded twice | PASSED |
+| 10 | Service with no enabled match → forwards nothing | PASSED |
+| 11 | Other service keeps working independently | PASSED |
+
+**Routing/normalization test** (`telegram_user.py`): confirmed channel-id
+matching works whether IDs are stored bare or `-100`-prefixed, and that an
+unrelated target channel never matches as a source.
+
+**Static checks**: every module (`config.py`, `database.py`, `filters.py`,
+`logger.py`, `forwarder.py`, `telegram_user.py`, `handlers.py`,
+`telegram_bot.py`, `main.py`, `test_filters.py`) compiles cleanly with
+`python -m py_compile`.
+
+Not independently testable in this environment (no live network / Telegram
+credentials available here): actual Telegram API connectivity, real
+`/addservice` channel-access validation against live channels, and the
+interactive Telegram button/callback flow end-to-end. These follow the same
+python-telegram-bot / Telethon APIs used in the original working
+deployment and should be verified once against your real bot/channels
+after deploying (see the walkthroughs in §7–§8).
+
+---
+
+## 11. Project structure
 
 ```
 toss-forward-bot/
 ├── main.py            # entrypoint — wires everything together
-├── config.py           # env var loading
-├── database.py          # SQLite: dedup, settings, stats, local logs
-├── matcher.py           # strict multi-layer pattern engine (core logic)
-├── telegram_user.py       # Telethon USER ACCOUNT client (monitors source)
-├── telegram_bot.py        # BOT ACCOUNT wrapper (admin commands)
-├── forwarder.py          # final safety gate + forward call
-├── handlers.py           # admin command implementations
+├── config.py           # env var loading (legacy source/target now optional)
+├── database.py          # SQLite: services, blacklist, dedup, stats, event log
+├── filters.py            # NEW — link/media/blacklist filter pipeline (replaces matcher.py)
+├── telegram_user.py       # Telethon USER ACCOUNT client (multi-service routing)
+├── telegram_bot.py        # BOT ACCOUNT wrapper (admin commands + callbacks)
+├── forwarder.py          # final safety gate + per-service forward call
+├── handlers.py           # admin command implementations (service mgmt, blacklist, monitoring)
 ├── logger.py            # local logging setup
-├── test_matcher.py        # unit tests for the matcher
+├── test_filters.py        # unit tests for the filter pipeline
 ├── requirements.txt
 ├── .env.example
 ├── Procfile
