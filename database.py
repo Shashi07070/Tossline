@@ -48,7 +48,7 @@ CREATE TABLE IF NOT EXISTS match_log (
 );
 """
 
-DEFAULT_STATS = ["checked", "matched", "forwarded", "ignored", "duplicates_prevented"]
+DEFAULT_STATS = ["checked", "matched", "forwarded", "ignored", "duplicates_prevented", "errors"]
 
 
 class Database:
@@ -158,3 +158,17 @@ class Database:
                 (limit,),
             )
             return await cur.fetchall()
+
+    async def count_matchlog_since(self, ts_from: float, decisions: tuple[str, ...]) -> int:
+        """Count match_log rows with ts >= ts_from and decision IN decisions.
+        Used for 'today' breakdowns in /stats without adding a new counters table."""
+        if not decisions:
+            return 0
+        placeholders = ",".join("?" for _ in decisions)
+        async with self._lock:
+            cur = await self._conn.execute(
+                f"SELECT COUNT(*) FROM match_log WHERE ts >= ? AND decision IN ({placeholders})",
+                (ts_from, *decisions),
+            )
+            row = await cur.fetchone()
+            return row[0] if row else 0

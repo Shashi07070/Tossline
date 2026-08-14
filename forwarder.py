@@ -17,6 +17,7 @@ Nothing else in the codebase should call target-channel send APIs directly.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional
 
 from telethon import TelegramClient
@@ -91,6 +92,7 @@ class Forwarder:
                 return
         except Exception as exc:
             self.logger.exception("Matcher raised during final safety gate; refusing to forward.")
+            await self.db.increment("errors")
             await self.db.log_match(message.id, "FINAL_GATE_ERROR", str(exc))
             return
 
@@ -103,6 +105,7 @@ class Forwarder:
             dest_id = self._extract_dest_id(sent)
         except Exception as exc:
             self.logger.exception("Forward failed for source_message_id=%s", message.id)
+            await self.db.increment("errors")
             await self.db.log_match(message.id, "FORWARD_FAILED", str(exc))
             return
 
@@ -111,6 +114,10 @@ class Forwarder:
         )
         if newly_recorded:
             await self.db.increment("forwarded")
+            await self.db.set_setting("last_match_ts", time.time())
+            await self.db.log_match(
+                message.id, "FORWARDED", f"team={result.team} decision={result.decision}"
+            )
             self.logger.info(
                 "Forwarded message %s (team=%s, decision=%s) -> target",
                 message.id, result.team, result.decision,

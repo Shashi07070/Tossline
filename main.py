@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import signal
+import time
 
 from config import settings
 from database import Database
@@ -52,13 +53,22 @@ async def async_main():
     pattern_config = await db.get_setting("pattern_config", DEFAULT_PATTERN_CONFIG)
     matcher_holder = {"matcher": TossMatcher(pattern_config)}
 
+    # Shared mutable state for admin commands that need things which don't
+    # exist yet at TelegramBot-construction time (e.g. the Telethon client),
+    # or process-level facts (start time) — see handlers.py docstring.
+    runtime = {
+        "start_time": time.time(),
+        "get_user_client": lambda: None,  # replaced below once user_client exists
+    }
+
     # --- Admin bot (control plane) ---
-    bot = TelegramBot(settings.bot_token, settings.admin_user_id, db, matcher_holder, logger)
+    bot = TelegramBot(settings.bot_token, settings.admin_user_id, db, matcher_holder, logger, runtime)
     await bot.start()
 
     # --- User client (monitors source channel) ---
     user_client = TelegramUserClient(settings, logger)
     await user_client.ensure_authorized()
+    runtime["get_user_client"] = lambda: user_client.client
 
     async def get_target_channel_id():
         return await db.get_setting("target_channel_id")
