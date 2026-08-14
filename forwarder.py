@@ -10,12 +10,12 @@ toss-pattern matcher is gone). Pipeline for every new source-channel message:
        b. link check                -> no URL/link, or reject
        c. blacklist check           -> no blacklisted term, or reject
        d. dedup check                -> not already processed, or skip
-       e. forward the ORIGINAL message, unmodified, to THAT service's target only
+       e. send the message TEXT as a NEW message to THAT service's target only
        f. record processed + stats
 
 A message from Source A can only ever reach Source A's configured target(s) —
 services are looked up by exact source_channel_id match, and each service's
-forward call is scoped to that service's own target_channel_id.
+send call is scoped to that service's own target_channel_id.
 
 Only this module is allowed to send messages into target channels.
 """
@@ -72,11 +72,12 @@ class Forwarder:
                 )
             return
 
-        # Allowed text message -> forward independently to each matching service's own target.
+        # Allowed text message -> send as a NEW message (no forward attribution)
+        # to each matching service's own target.
         for service in matching_services:
-            await self._forward_to_service(message, source_channel_id, service, result)
+            await self._send_to_service(message, source_channel_id, service, result)
 
-    async def _forward_to_service(self, message: Message, source_channel_id: int, service: dict, result):
+    async def _send_to_service(self, message: Message, source_channel_id: int, service: dict, result):
         service_id = service["id"]
         target_channel_id = service["target_channel_id"]
 
@@ -96,19 +97,27 @@ class Forwarder:
                 )
                 return
         except Exception as exc:
-            self.logger.exception("Final safety gate raised for service %s; refusing to forward.", service_id)
+            self.logger.exception("Final safety gate raised for service %s; refusing to send.", service_id)
             await self.db.increment("errors")
             await self.db.log_event("error", service_id=service_id, source_message_id=message.id, detail=str(exc))
             return
 
+        # Guard: ensure we have actual text to send.
+        text_to_send = message.text
+        if not text_to_send:
+            self.logger.warning("Message %s from source %s has no text; skipping.", message.id, source_channel_id)
+            await self.db.log_event("error", service_id=service_id, source_message_id=message.id, detail="Empty text")
+            return
+
         try:
-            sent = await self.user_client.forward_messages(
+            # Send as a NEW message — no "Forwarded from" attribution.
+            sent = await self.user_client.send_message(
                 entity=target_channel_id,
-                messages=message,
+                message=text_to_send,
             )
             dest_id = self._extract_dest_id(sent)
         except Exception as exc:
-            self.logger.exception("Forward failed (service=%s, source_message_id=%s)", service_id, message.id)
+            self.logger.exception("Send failed (service=%s, source_message_id=%s)", service_id, message.id)
             await self.db.increment("errors")
             await self.db.record_service_error(service_id, str(exc))
             await self.db.log_event("error", service_id=service_id, source_message_id=message.id, detail=str(exc))
@@ -122,8 +131,8 @@ class Forwarder:
             await self.db.record_service_forward(service_id)
             await self.db.log_event("forwarded", service_id=service_id, source_message_id=message.id)
             self.logger.info(
-                "Forwarded message %s from source %s to target %s (service %s)",
-                message.id, source_channel_id, target_channel_id, service_id,
+                "Sent new message (source %s -> target %s, service %s) based on message %s",
+                source_channel_id, target_channel_id, service_id, message.id,
             )
         else:
             # Rare race: another handler already recorded it first.
