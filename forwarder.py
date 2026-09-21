@@ -1,135 +1,102 @@
-"""
-forwarder.py — The final safety gate before anything reaches any target channel.
-
-DIAGNOSTIC EDITION: adds detailed logging for blacklist debugging.
-"""
-
-from __future__ import annotations
-
+import asyncio
 import logging
-from typing import Optional
+from telethon import events
+from telethon.errors import FloodWaitError
+from filters import should_forward_message
+from collections import deque
 
-from telethon import TelegramClient
-from telethon.tl.custom import Message
+logger = logging.getLogger(__name__)
 
-from database import Database
-from filters import evaluate_message
+# In-memory duplicate cache for FAST lookups
+duplicate_cache = {}  # {chat_id: deque([(msg_id), ...], maxlen=10000)}
+CACHE_SIZE = 10000
 
+def is_duplicate_fast(chat_id, message_id):
+    """Fast in-memory duplicate check (no DB query)"""
+    if chat_id not in duplicate_cache:
+        duplicate_cache[chat_id] = deque(maxlen=CACHE_SIZE)
+    
+    if message_id in duplicate_cache[chat_id]:
+        return True
+    
+    duplicate_cache[chat_id].append(message_id)
+    return False
 
-class Forwarder:
-    def __init__(
-        self,
-        user_client: TelegramClient,
-        db: Database,
-        logger: logging.Logger,
-        get_blacklist,
-    ):
-        self.user_client = user_client
-        self.db = db
-        self.logger = logger
-        self._get_blacklist = get_blacklist
+async def persist_to_db_async(db, chat_id, message_id):
+    """Non-blocking DB write"""
+    await asyncio.to_thread(db.mark_as_processed, chat_id, message_id)
 
-    async def handle_incoming(self, message: Message, matching_services: list[dict]):
-        if not matching_services:
-            return
+async def update_stats_async(db, service_name, stat_type):
+    """Non-blocking stats update"""
+    await asyncio.to_thread(db.increment_stat, service_name, stat_type)
 
-        await self.db.increment("received")
-        blacklist = await self._get_blacklist()
-
-        # ─── DIAGNOSTIC LOGGING ───
-        msg_text = message.raw_text or message.message or ""
-        self.logger.info(
-            "[BLACKLIST DEBUG] msg_id=%s chat_id=%s text=%r blacklist_terms=%r",
-            message.id, message.chat_id, msg_text, blacklist,
-        )
-        # ───────────────────────────
-
-        result = evaluate_message(message, blacklist)
-
-        # ─── DIAGNOSTIC LOGGING ───
-        self.logger.info(
-            "[BLACKLIST DEBUG] msg_id=%s result.allowed=%s result.reason=%r",
-            message.id, result.allowed, result.reason,
-        )
-        # ───────────────────────────
-
-        source_channel_id = message.chat_id
-
-        if not result.allowed:
-            await self.db.increment("blocked")
-            for service in matching_services:
-                await self.db.record_service_block(service["id"])
-                await self.db.log_event(
-                    "blocked", service_id=service["id"],
-                    source_message_id=message.id, detail=result.reason,
-                )
-            return
-
-        for service in matching_services:
-            await self._send_to_service(message, source_channel_id, service, result)
-
-    async def _send_to_service(self, message: Message, source_channel_id: int, service: dict, result):
-        service_id = service["id"]
-        target_channel_id = service["target_channel_id"]
-
-        if await self.db.is_processed(service_id, source_channel_id, message.id):
-            await self.db.increment("duplicates_prevented")
-            await self.db.log_event("duplicate", service_id=service_id, source_message_id=message.id)
-            return
-
+async def forward_message(client, event, service, db, blacklist):
+    """
+    OPTIMIZED: Zero-delay forwarding path
+    
+    Performance improvements:
+    - Removed artificial 2s sleep
+    - In-memory duplicate check (no DB query)
+    - Async DB writes (non-blocking)
+    - Stats updated in background
+    """
+    
+    # ✅ FAST: In-memory duplicate check
+    if is_duplicate_fast(event.chat_id, event.message.id):
+        logger.info(f"[{service['name']}] Duplicate message {event.message.id} - skipping")
+        asyncio.create_task(update_stats_async(db, service['name'], 'blocked'))
+        return
+    
+    # ✅ FAST: Filter checks (no DB/network I/O)
+    if not should_forward_message(event.message, blacklist):
+        logger.info(f"[{service['name']}] Message {event.message.id} blocked by filters")
+        asyncio.create_task(update_stats_async(db, service['name'], 'blocked'))
+        return
+    
+    # ✅ IMMEDIATE FORWARDING - NO DELAY
+    target_channels = [int(ch.strip()) for ch in service['target_channels'].split(',')]
+    
+    for target_chat in target_channels:
         try:
-            final = evaluate_message(message, await self._get_blacklist())
-            if not final.allowed:
-                await self.db.log_event(
-                    "final_gate_rejected", service_id=service_id,
-                    source_message_id=message.id, detail=final.reason,
-                )
-                return
-        except Exception as exc:
-            self.logger.exception("Final safety gate raised for service %s; refusing to send.", service_id)
-            await self.db.increment("errors")
-            await self.db.log_event("error", service_id=service_id, source_message_id=message.id, detail=str(exc))
-            return
+            # Send as new message (no "Forwarded from" watermark)
+            await client.send_message(target_chat, event.message.text)
+            logger.info(f"[{service['name']}] ✓ Forwarded msg {event.message.id} → {target_chat}")
+        
+        except FloodWaitError as e:
+            # ✅ ONLY delay on actual Telegram flood limit
+            logger.warning(f"FloodWait: sleeping {e.seconds}s for {target_chat}")
+            await asyncio.sleep(e.seconds)
+            await client.send_message(target_chat, event.message.text)
+        
+        except Exception as e:
+            logger.error(f"[{service['name']}] Error forwarding to {target_chat}: {e}")
+    
+    # ✅ ASYNC: DB/stats updates happen AFTER sending (non-blocking)
+    asyncio.create_task(persist_to_db_async(db, event.chat_id, event.message.id))
+    asyncio.create_task(update_stats_async(db, service['name'], 'forwarded'))
 
-        text_to_send = message.text
-        if not text_to_send:
-            self.logger.warning("Message %s from source %s has no text; skipping.", message.id, source_channel_id)
-            await self.db.log_event("error", service_id=service_id, source_message_id=message.id, detail="Empty text")
-            return
-
-        try:
-            sent = await self.user_client.send_message(
-                entity=target_channel_id,
-                message=text_to_send,
-            )
-            dest_id = self._extract_dest_id(sent)
-        except Exception as exc:
-            self.logger.exception("Send failed (service=%s, source_message_id=%s)", service_id, message.id)
-            await self.db.increment("errors")
-            await self.db.record_service_error(service_id, str(exc))
-            await self.db.log_event("error", service_id=service_id, source_message_id=message.id, detail=str(exc))
-            return
-
-        newly_recorded = await self.db.mark_processed(
-            service_id, source_channel_id, message.id, dest_id, result="FORWARDED"
-        )
-        if newly_recorded:
-            await self.db.increment("forwarded")
-            await self.db.record_service_forward(service_id)
-            await self.db.log_event("forwarded", service_id=service_id, source_message_id=message.id)
-            self.logger.info(
-                "Sent new message (source %s -> target %s, service %s) based on message %s",
-                source_channel_id, target_channel_id, service_id, message.id,
-            )
-        else:
-            await self.db.increment("duplicates_prevented")
-            await self.db.log_event("duplicate_race", service_id=service_id, source_message_id=message.id)
-
-    @staticmethod
-    def _extract_dest_id(sent) -> Optional[int]:
-        try:
-            if isinstance(sent, list):
-                return sent[0].id if sent else None
-            return sent.id
-        except Exception:
-            return None
+def setup_handlers(client, db):
+    """Setup event handlers for all active services"""
+    services = db.get_services()
+    blacklist = db.get_blacklist()
+    
+    active_handlers = set()
+    
+    for service in services:
+        if not service['active']:
+            continue
+        
+        source_channels = [int(ch.strip()) for ch in service['source_channels'].split(',')]
+        
+        # Prevent duplicate handlers
+        handler_key = (service['name'], tuple(source_channels))
+        if handler_key in active_handlers:
+            continue
+        
+        active_handlers.add(handler_key)
+        
+        @client.on(events.NewMessage(chats=source_channels))
+        async def handler(event, svc=service, bl=blacklist):
+            await forward_message(client, event, svc, db, bl)
+        
+        logger.info(f"✓ Handler registered for '{service['name']}' (sources: {source_channels})")
